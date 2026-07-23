@@ -8,13 +8,14 @@ import threading
 import gspread
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
-from flask import Flask, render_template_string
+from flask import Flask, render_template_string, jsonify
 from flask_socketio import SocketIO, emit
 
-# Initialize Flask App & SocketIO (Using standard threading for Python 3.14 compatibility)
+# Initialize Flask App & SocketIO
 app = Flask(__name__)
 app.config['SECRET_KEY'] = 'secret!'
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
+# Allow all origins and force polling/websocket fallback
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading', ping_timeout=60, ping_interval=25)
 
 # Store log history in memory so new page loads see past output
 LOG_HISTORY = []
@@ -31,7 +32,6 @@ class SocketLogger:
         if msg:
             timestamped_msg = f"[{time.strftime('%X')}] {msg}"
             LOG_HISTORY.append(timestamped_msg)
-            # Keep history to last 200 lines to save memory
             if len(LOG_HISTORY) > 200:
                 LOG_HISTORY.pop(0)
             socketio.emit('log_message', {'data': timestamped_msg})
@@ -46,7 +46,6 @@ SPREADSHEET_NAME = ' V6 SRT 6.3 Dashboard '
 SHEET_NAME = 'ID_Entry'
 INTERVAL_SECONDS = 63.890 
 
-# Reads credentials safely from Environment Variables (Set in Render Dashboard)
 CLIENT_ID = os.environ.get("CLIENT_ID") or os.environ.get("G_CLIENT_ID")
 CLIENT_SECRET = os.environ.get("CLIENT_SECRET") or os.environ.get("G_CLIENT_SECRET")
 REFRESH_TOKEN = os.environ.get("REFRESH_TOKEN") or os.environ.get("G_REFRESH_TOKEN")
@@ -62,7 +61,7 @@ HTML_TEMPLATE = """
 <html>
 <head>
     <title>Live Script Output Dashboard</title>
-    <script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.5.4/socket.io.min.js"></script>
     <style>
         body { background-color: #1e1e1e; color: #00ff00; font-family: monospace; padding: 20px; }
         #console { background-color: #000; border: 1px solid #333; padding: 15px; height: 80vh; overflow-y: scroll; border-radius: 5px; }
@@ -71,25 +70,40 @@ HTML_TEMPLATE = """
 </head>
 <body>
     <h2>Live Terminal Output Dashboard</h2>
-    <div id="console"></div>
+    <div id="console">Initializing connection...</div>
 
     <script>
-        var socket = io();
         var consoleDiv = document.getElementById('console');
 
-        // Receives all past logs when connected
-        socket.on('history', function(history) {
+        // Function to render logs
+        function renderLogs(logs) {
             consoleDiv.innerHTML = '';
-            history.forEach(function(msg) {
+            if (logs.length === 0) {
+                consoleDiv.innerHTML = '<div class="log-entry">Waiting for new log output...</div>';
+                return;
+            }
+            logs.forEach(function(msg) {
                 var item = document.createElement('div');
                 item.className = 'log-entry';
                 item.textContent = msg;
                 consoleDiv.appendChild(item);
             });
             consoleDiv.scrollTop = consoleDiv.scrollHeight;
+        }
+
+        // 1. Initial HTTP Fetch for historical logs (Guaranteed to work across all networks)
+        fetch('/api/logs')
+            .then(response => response.json())
+            .then(data => renderLogs(data))
+            .catch(err => console.error("Error fetching logs:", err));
+
+        // 2. Connect via Socket.IO for real-time updates
+        var socket = io({ transports: ['polling', 'websocket'] });
+
+        socket.on('history', function(history) {
+            renderLogs(history);
         });
 
-        // Receives new live logs
         socket.on('log_message', function(msg) {
             var item = document.createElement('div');
             item.className = 'log-entry';
@@ -106,9 +120,12 @@ HTML_TEMPLATE = """
 def index():
     return render_template_string(HTML_TEMPLATE)
 
+@app.route('/api/logs')
+def get_logs():
+    return jsonify(LOG_HISTORY)
+
 @socketio.on('connect')
 def handle_connect():
-    # Send history to client immediately when they open the URL
     emit('history', LOG_HISTORY)
 
 def connect_to_gsheet():
@@ -150,14 +167,12 @@ def get_initial_state(sheet):
     return sequence, current_row
 
 def format_detailed_time(dt):
-    """Formats datetime object into human readable text including ms & µs."""
     time_str = dt.strftime("%H:%M:%S")
     hours = dt.strftime("%I")
     minutes = dt.strftime("%M")
     seconds = dt.strftime("%S")
     microseconds = dt.strftime("%f")
     milliseconds = f"{int(microseconds) // 1000:03d}"
-    
     return f"{time_str} ({int(hours)} hours {int(minutes)} minute {int(seconds)} seconds {milliseconds} milliseconds {microseconds} microseconds)"
 
 def run_sheets_automation():
@@ -177,18 +192,15 @@ def run_sheets_automation():
         last_b_value = 0
 
         while True:
-            # 1. Record start time when the countdown / wait begins
             countdown_start_dt = datetime.now()
             print(f"\n⏳ [CYCLE START] Waiting {INTERVAL_SECONDS} seconds before next check...")
             print(f"🕒 [WAIT START] Timer started at: {format_detailed_time(countdown_start_dt)}")
 
             time.sleep(INTERVAL_SECONDS)
             
-            # Fetch latest value from Column B for current row
             print(f"🔎 Reading Column B value at Row {current_row}...")
             manual_b_val = sheet.cell(current_row, 2).value
             
-            # Fallback if starting fresh on Row > 2
             if last_b_value == 0 and current_row > 2:
                 prev_b_val = sheet.cell(current_row - 1, 2).value
                 try:
@@ -213,16 +225,13 @@ def run_sheets_automation():
                 else:
                     last_b_value = (last_b_value or 0) + 1
 
-            # Update Google Sheet
             print(f"📝 Writing to Google Sheet at Row {current_row} (A: {sequence}, B: {last_b_value})...")
             sheet.update(range_name=f"A{current_row}:B{current_row}", values=[[sequence, last_b_value]])
             
-            # 2. Record logged time immediately after update
             logged_dt = datetime.now()
             print(f"✅ [LOGGED SUCCESS] Row {current_row} -> A{current_row}: {sequence} | B{current_row}: {last_b_value}")
             print(f"🕒 [LOGGED AT] Completed at: {format_detailed_time(logged_dt)}")
 
-            # 3. Calculate exact duration from Wait Start to Logged
             duration = logged_dt - countdown_start_dt
             total_sec = duration.total_seconds()
             mins = int(total_sec // 60)
