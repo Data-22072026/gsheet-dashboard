@@ -41,6 +41,9 @@ class SocketLogger:
 
 sys.stdout = SocketLogger(sys.stdout)
 
+# Print an immediate initial message so LOG_HISTORY is never empty
+print("🌐 Web Server Started. Waiting for Google Sheets automation to initialize...")
+
 # Google Sheet Configuration
 SPREADSHEET_NAME = ' V6 SRT 6.3 Dashboard '
 SHEET_NAME = 'ID_Entry'
