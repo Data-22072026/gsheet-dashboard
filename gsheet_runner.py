@@ -3,24 +3,20 @@
 import os
 import sys
 import time
+import queue
 from datetime import datetime
 import threading
 import gspread
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
-from flask import Flask, render_template_string, jsonify
-from flask_socketio import SocketIO, emit
+from flask import Flask, render_template_string, Response, jsonify
 
-# Initialize Flask App & SocketIO
 app = Flask(__name__)
-app.config['SECRET_KEY'] = 'secret!'
-# Allow all origins and force polling/websocket fallback
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading', ping_timeout=60, ping_interval=25)
 
-# Store log history in memory so new page loads see past output
+# Memory storage for logs and SSE broadcast listeners
 LOG_HISTORY = []
+LISTENERS = []
 
-# Custom Logger to redirect print() statements to Terminal, WebSockets, and Memory
 class SocketLogger:
     def __init__(self, original_stdout):
         self.terminal = original_stdout
@@ -34,15 +30,19 @@ class SocketLogger:
             LOG_HISTORY.append(timestamped_msg)
             if len(LOG_HISTORY) > 200:
                 LOG_HISTORY.pop(0)
-            socketio.emit('log_message', {'data': timestamped_msg})
+            
+            # Broadcast live log to all connected browsers
+            for q in list(LISTENERS):
+                try:
+                    q.put_nowait(timestamped_msg)
+                except queue.Full:
+                    pass
 
     def flush(self):
         self.terminal.flush()
 
 sys.stdout = SocketLogger(sys.stdout)
-
-# Print an immediate initial message so LOG_HISTORY is never empty
-print("🌐 Web Server Started. Waiting for Google Sheets automation to initialize...")
+print("🌐 Web Server Started. Automation engine loading...")
 
 # Google Sheet Configuration
 SPREADSHEET_NAME = ' V6 SRT 6.3 Dashboard '
@@ -64,7 +64,6 @@ HTML_TEMPLATE = """
 <html>
 <head>
     <title>Live Script Output Dashboard</title>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.5.4/socket.io.min.js"></script>
     <style>
         body { background-color: #1e1e1e; color: #00ff00; font-family: monospace; padding: 20px; }
         #console { background-color: #000; border: 1px solid #333; padding: 15px; height: 80vh; overflow-y: scroll; border-radius: 5px; }
@@ -73,47 +72,39 @@ HTML_TEMPLATE = """
 </head>
 <body>
     <h2>Live Terminal Output Dashboard</h2>
-    <div id="console">Initializing connection...</div>
+    <div id="console"><div class="log-entry">Connecting to live log stream...</div></div>
 
     <script>
         var consoleDiv = document.getElementById('console');
 
-        // Function to render logs
-        function renderLogs(logs) {
-            consoleDiv.innerHTML = '';
-            if (logs.length === 0) {
-                consoleDiv.innerHTML = '<div class="log-entry">Waiting for new log output...</div>';
-                return;
-            }
-            logs.forEach(function(msg) {
-                var item = document.createElement('div');
-                item.className = 'log-entry';
-                item.textContent = msg;
-                consoleDiv.appendChild(item);
-            });
+        function appendLog(text) {
+            var item = document.createElement('div');
+            item.className = 'log-entry';
+            item.textContent = text;
+            consoleDiv.appendChild(item);
             consoleDiv.scrollTop = consoleDiv.scrollHeight;
         }
 
-        // 1. Initial HTTP Fetch for historical logs (Guaranteed to work across all networks)
+        // 1. Load History on initial page load
         fetch('/api/logs')
-            .then(response => response.json())
-            .then(data => renderLogs(data))
-            .catch(err => console.error("Error fetching logs:", err));
+            .then(res => res.json())
+            .then(data => {
+                consoleDiv.innerHTML = '';
+                if (data.length === 0) {
+                    appendLog("Waiting for automation output...");
+                } else {
+                    data.forEach(msg => appendLog(msg));
+                }
+            });
 
-        // 2. Connect via Socket.IO for real-time updates
-        var socket = io({ transports: ['polling', 'websocket'] });
-
-        socket.on('history', function(history) {
-            renderLogs(history);
-        });
-
-        socket.on('log_message', function(msg) {
-            var item = document.createElement('div');
-            item.className = 'log-entry';
-            item.textContent = msg.data;
-            consoleDiv.appendChild(item);
-            consoleDiv.scrollTop = consoleDiv.scrollHeight;
-        });
+        // 2. Stream Live Log Updates via Server-Sent Events (SSE)
+        var evtSource = new EventSource("/stream");
+        evtSource.onmessage = function(e) {
+            appendLog(e.data);
+        };
+        evtSource.onerror = function() {
+            console.log("Stream reconnecting...");
+        };
     </script>
 </body>
 </html>
@@ -127,9 +118,19 @@ def index():
 def get_logs():
     return jsonify(LOG_HISTORY)
 
-@socketio.on('connect')
-def handle_connect():
-    emit('history', LOG_HISTORY)
+@app.route('/stream')
+def stream():
+    def event_stream():
+        q = queue.Queue()
+        LISTENERS.append(q)
+        try:
+            while True:
+                msg = q.get()
+                yield f"data: {msg}\n\n"
+        except GeneratorExit:
+            LISTENERS.remove(q)
+
+    return Response(event_stream(), mimetype="text/event-stream")
 
 def connect_to_gsheet():
     if not all([CLIENT_ID, CLIENT_SECRET, REFRESH_TOKEN]):
@@ -254,4 +255,4 @@ thread.daemon = True
 thread.start()
 
 if __name__ == '__main__':
-    socketio.run(app, host='0.0.0.0', port=5000)
+    app.run(host='0.0.0.0', port=5000)
