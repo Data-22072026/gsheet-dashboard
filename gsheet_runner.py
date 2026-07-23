@@ -1,5 +1,3 @@
-# http://localhost:5000/
-
 import os
 import sys
 import time
@@ -180,18 +178,22 @@ def format_detailed_time(dt):
     return f"{time_str} ({int(hours)} hours {int(minutes)} minute {int(seconds)} seconds {milliseconds} milliseconds {microseconds} microseconds)"
 
 def run_sheets_automation():
-    time.sleep(2)
+    time.sleep(1)
     print("==================================================")
     print("🚀 INITIALIZING GOOGLE SHEETS AUTOMATION ENGINE")
     print("==================================================")
-    print("Connecting to Google Sheets...")
+    print("Checking environment variables & connecting to Google Sheets...")
+    sys.stdout.flush()
+    
     try:
         sheet = connect_to_gsheet()
         print(f"✅ Connected successfully to: '{SPREADSHEET_NAME}' -> '{SHEET_NAME}'!\n")
+        sys.stdout.flush()
         
         sequence, current_row = get_initial_state(sheet)
         print(f"📊 Starting Execution State -> Next Row: {current_row} | Initial ID Sequence: {sequence}")
         print("--------------------------------------------------")
+        sys.stdout.flush()
         
         last_b_value = 0
 
@@ -199,6 +201,7 @@ def run_sheets_automation():
             countdown_start_dt = datetime.now()
             print(f"\n⏳ [CYCLE START] Waiting {INTERVAL_SECONDS} seconds before next check...")
             print(f"🕒 [WAIT START] Timer started at: {format_detailed_time(countdown_start_dt)}")
+            sys.stdout.flush()
 
             time.sleep(INTERVAL_SECONDS)
             
@@ -242,12 +245,16 @@ def run_sheets_automation():
             secs = total_sec % 60
             print(f"⏱️ [ROW TIME GAP] Total time from timer start to logged: {mins} minutes {secs:.3f} seconds ({total_sec:.6f} seconds total)")
             print("--------------------------------------------------")
+            sys.stdout.flush()
 
             sequence += 1
             current_row += 1
 
     except Exception as e:
-        print(f"\n❌ [ERROR] An error occurred in the automation loop: {e}")
+        import traceback
+        print(f"\n❌ [CRITICAL AUTOMATION ERROR] {e}")
+        print(traceback.format_exc())
+        sys.stdout.flush()
 
 # Start background thread
 thread = threading.Thread(target=run_sheets_automation)
