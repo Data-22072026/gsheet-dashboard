@@ -8,10 +8,10 @@ from google.auth.transport.requests import Request
 from flask import Flask, render_template_string
 from flask_socketio import SocketIO, emit
 
-# Initialize Flask App & SocketIO
+# Initialize Flask App & SocketIO (Force threading for Python 3.14 compatibility)
 app = Flask(__name__)
 app.config['SECRET_KEY'] = 'secret!'
-socketio = SocketIO(app, cors_allowed_origins="*")
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
 
 # Store log history in memory so new page loads see past output
 LOG_HISTORY = []
@@ -28,7 +28,6 @@ class SocketLogger:
         if msg:
             timestamped_msg = f"[{time.strftime('%X')}] {msg}"
             LOG_HISTORY.append(timestamped_msg)
-            # Keep history to last 200 lines to preserve memory
             if len(LOG_HISTORY) > 200:
                 LOG_HISTORY.pop(0)
             socketio.emit('log_message', {'data': timestamped_msg})
@@ -43,7 +42,6 @@ SPREADSHEET_NAME = ' V6 SRT 6.3 Dashboard '
 SHEET_NAME = 'ID_Entry'
 INTERVAL_SECONDS = 63.890 
 
-# Read tokens securely from Environment Variables (Set in Render Dashboard)
 CLIENT_ID = os.environ.get("CLIENT_ID") or os.environ.get("G_CLIENT_ID")
 CLIENT_SECRET = os.environ.get("CLIENT_SECRET") or os.environ.get("G_CLIENT_SECRET")
 REFRESH_TOKEN = os.environ.get("REFRESH_TOKEN") or os.environ.get("G_REFRESH_TOKEN")
@@ -74,7 +72,6 @@ HTML_TEMPLATE = """
         var socket = io();
         var consoleDiv = document.getElementById('console');
 
-        // Receives all past logs when connected
         socket.on('history', function(history) {
             consoleDiv.innerHTML = '';
             history.forEach(function(msg) {
@@ -86,7 +83,6 @@ HTML_TEMPLATE = """
             consoleDiv.scrollTop = consoleDiv.scrollHeight;
         });
 
-        // Receives new live logs
         socket.on('log_message', function(msg) {
             var item = document.createElement('div');
             item.className = 'log-entry';
@@ -105,13 +101,15 @@ def index():
 
 @socketio.on('connect')
 def handle_connect():
-    # Send historical logs to client immediately when they connect
     emit('history', LOG_HISTORY)
 
 def connect_to_gsheet():
+    print("Checking Google OAuth environment variables...")
     if not all([CLIENT_ID, CLIENT_SECRET, REFRESH_TOKEN]):
+        print("ERROR: One or more OAuth credentials missing in environment variables!")
         raise ValueError("Missing Google OAuth credentials in Environment Variables.")
 
+    print("Building credentials object...")
     creds = Credentials(
         token=None,
         refresh_token=REFRESH_TOKEN,
@@ -122,16 +120,22 @@ def connect_to_gsheet():
     )
 
     if not creds.valid:
+        print("Refreshing access token from Google OAuth...")
         creds.refresh(Request())
 
+    print("Authorizing gspread client...")
     client = gspread.authorize(creds)
+    
+    print(f"Opening Google Spreadsheet '{SPREADSHEET_NAME}' and worksheet '{SHEET_NAME}'...")
     sheet = client.open(SPREADSHEET_NAME).worksheet(SHEET_NAME)
     return sheet
 
 def get_initial_state(sheet):
+    print("Fetching existing Column A values to check initial state...")
     col_a_values = sheet.col_values(1)
     
     if len(col_a_values) == 0 or col_a_values[0] != 'ID_Entry':
+        print("Header 'ID_Entry' not found in A1. Setting A1 to 'ID_Entry'...")
         sheet.update_cell(1, 1, 'ID_Entry')
     
     current_row = max(len(col_a_values), 1) + 1
@@ -144,48 +148,52 @@ def get_initial_state(sheet):
     except (ValueError, TypeError):
         sequence = 1
 
+    print(f"Initial state set: Starting at Row {current_row} with Sequence ID {sequence}.")
     return sequence, current_row
 
 def run_sheets_automation():
     time.sleep(2)
-    print("Connecting to Google Sheets...")
+    print("--------------------------------------------------")
+    print("Starting Google Sheets Automation Loop...")
+    print("--------------------------------------------------")
     try:
         sheet = connect_to_gsheet()
-        print(f"Connected successfully to '{SPREADSHEET_NAME}' -> '{SHEET_NAME}'!\n")
+        print(f"SUCCESS: Connected to '{SPREADSHEET_NAME}' -> '{SHEET_NAME}'!\n")
+        
         sequence, current_row = get_initial_state(sheet)
-        last_b_value = None
+        last_b_value = 0
 
         while True:
-            print(f"Waiting {INTERVAL_SECONDS} seconds...")
+            print(f"Waiting {INTERVAL_SECONDS} seconds before next check...")
             time.sleep(INTERVAL_SECONDS)
             
+            print(f"Checking cell B{current_row} for manual override value...")
             manual_b_val = sheet.cell(current_row, 2).value
             
-            if current_row == 2:
-                if manual_b_val is not None and str(manual_b_val).strip() != "":
-                    try:
-                        last_b_value = int(manual_b_val)
-                    except ValueError:
-                        last_b_value = 0
-                else:
-                    last_b_value = 0
+            if manual_b_val is not None and str(manual_b_val).strip() != "":
+                print(f"Found manual entry in B{current_row}: '{manual_b_val}'")
+                try:
+                    last_b_value = int(manual_b_val)
+                    print(f"Parsed manual value as integer: {last_b_value}")
+                except ValueError:
+                    print(f"Could not convert '{manual_b_val}' to integer. Incrementing previous value instead.")
+                    last_b_value += 1
             else:
-                if manual_b_val is not None and str(manual_b_val).strip() != "":
-                    try:
-                        last_b_value = int(manual_b_val)
-                    except ValueError:
-                        last_b_value += 1
+                print(f"No manual entry found in B{current_row}.")
+                if current_row == 2:
+                    last_b_value = 0
                 else:
                     last_b_value += 1
 
+            print(f"Updating Google Sheet -> A{current_row}: {sequence} | B{current_row}: {last_b_value}...")
             sheet.update(range_name=f"A{current_row}:B{current_row}", values=[[sequence, last_b_value]])
-            print(f"[LOGGED] Row {current_row} -> A{current_row}: {sequence} | B{current_row}: {last_b_value}")
+            print(f"[SUCCESS LOGGED] Row {current_row} updated successfully -> Sequence: {sequence}, Value: {last_b_value}\n")
             
             sequence += 1
             current_row += 1
 
     except Exception as e:
-        print(f"\nAn error occurred: {e}")
+        print(f"\nCRITICAL ERROR in automation loop: {e}")
 
 # Start background thread
 thread = threading.Thread(target=run_sheets_automation)
