@@ -1,6 +1,9 @@
+# http://localhost:5000/
+
 import os
 import sys
 import time
+from datetime import datetime
 import threading
 import gspread
 from google.oauth2.credentials import Credentials
@@ -8,7 +11,7 @@ from google.auth.transport.requests import Request
 from flask import Flask, render_template_string
 from flask_socketio import SocketIO, emit
 
-# Initialize Flask App & SocketIO (Force threading for Python 3.14 compatibility)
+# Initialize Flask App & SocketIO (Using standard threading for Python 3.14 compatibility)
 app = Flask(__name__)
 app.config['SECRET_KEY'] = 'secret!'
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
@@ -28,6 +31,7 @@ class SocketLogger:
         if msg:
             timestamped_msg = f"[{time.strftime('%X')}] {msg}"
             LOG_HISTORY.append(timestamped_msg)
+            # Keep history to last 200 lines to save memory
             if len(LOG_HISTORY) > 200:
                 LOG_HISTORY.pop(0)
             socketio.emit('log_message', {'data': timestamped_msg})
@@ -42,6 +46,7 @@ SPREADSHEET_NAME = ' V6 SRT 6.3 Dashboard '
 SHEET_NAME = 'ID_Entry'
 INTERVAL_SECONDS = 63.890 
 
+# Reads credentials safely from Environment Variables (Set in Render Dashboard)
 CLIENT_ID = os.environ.get("CLIENT_ID") or os.environ.get("G_CLIENT_ID")
 CLIENT_SECRET = os.environ.get("CLIENT_SECRET") or os.environ.get("G_CLIENT_SECRET")
 REFRESH_TOKEN = os.environ.get("REFRESH_TOKEN") or os.environ.get("G_REFRESH_TOKEN")
@@ -72,6 +77,7 @@ HTML_TEMPLATE = """
         var socket = io();
         var consoleDiv = document.getElementById('console');
 
+        // Receives all past logs when connected
         socket.on('history', function(history) {
             consoleDiv.innerHTML = '';
             history.forEach(function(msg) {
@@ -83,6 +89,7 @@ HTML_TEMPLATE = """
             consoleDiv.scrollTop = consoleDiv.scrollHeight;
         });
 
+        // Receives new live logs
         socket.on('log_message', function(msg) {
             var item = document.createElement('div');
             item.className = 'log-entry';
@@ -101,15 +108,13 @@ def index():
 
 @socketio.on('connect')
 def handle_connect():
+    # Send history to client immediately when they open the URL
     emit('history', LOG_HISTORY)
 
 def connect_to_gsheet():
-    print("Checking Google OAuth environment variables...")
     if not all([CLIENT_ID, CLIENT_SECRET, REFRESH_TOKEN]):
-        print("ERROR: One or more OAuth credentials missing in environment variables!")
         raise ValueError("Missing Google OAuth credentials in Environment Variables.")
 
-    print("Building credentials object...")
     creds = Credentials(
         token=None,
         refresh_token=REFRESH_TOKEN,
@@ -120,22 +125,16 @@ def connect_to_gsheet():
     )
 
     if not creds.valid:
-        print("Refreshing access token from Google OAuth...")
         creds.refresh(Request())
 
-    print("Authorizing gspread client...")
     client = gspread.authorize(creds)
-    
-    print(f"Opening Google Spreadsheet '{SPREADSHEET_NAME}' and worksheet '{SHEET_NAME}'...")
     sheet = client.open(SPREADSHEET_NAME).worksheet(SHEET_NAME)
     return sheet
 
 def get_initial_state(sheet):
-    print("Fetching existing Column A values to check initial state...")
     col_a_values = sheet.col_values(1)
     
     if len(col_a_values) == 0 or col_a_values[0] != 'ID_Entry':
-        print("Header 'ID_Entry' not found in A1. Setting A1 to 'ID_Entry'...")
         sheet.update_cell(1, 1, 'ID_Entry')
     
     current_row = max(len(col_a_values), 1) + 1
@@ -148,52 +147,94 @@ def get_initial_state(sheet):
     except (ValueError, TypeError):
         sequence = 1
 
-    print(f"Initial state set: Starting at Row {current_row} with Sequence ID {sequence}.")
     return sequence, current_row
+
+def format_detailed_time(dt):
+    """Formats datetime object into human readable text including ms & µs."""
+    time_str = dt.strftime("%H:%M:%S")
+    hours = dt.strftime("%I")
+    minutes = dt.strftime("%M")
+    seconds = dt.strftime("%S")
+    microseconds = dt.strftime("%f")
+    milliseconds = f"{int(microseconds) // 1000:03d}"
+    
+    return f"{time_str} ({int(hours)} hours {int(minutes)} minute {int(seconds)} seconds {milliseconds} milliseconds {microseconds} microseconds)"
 
 def run_sheets_automation():
     time.sleep(2)
-    print("--------------------------------------------------")
-    print("Starting Google Sheets Automation Loop...")
-    print("--------------------------------------------------")
+    print("==================================================")
+    print("🚀 INITIALIZING GOOGLE SHEETS AUTOMATION ENGINE")
+    print("==================================================")
+    print("Connecting to Google Sheets...")
     try:
         sheet = connect_to_gsheet()
-        print(f"SUCCESS: Connected to '{SPREADSHEET_NAME}' -> '{SHEET_NAME}'!\n")
+        print(f"✅ Connected successfully to: '{SPREADSHEET_NAME}' -> '{SHEET_NAME}'!\n")
         
         sequence, current_row = get_initial_state(sheet)
+        print(f"📊 Starting Execution State -> Next Row: {current_row} | Initial ID Sequence: {sequence}")
+        print("--------------------------------------------------")
+        
         last_b_value = 0
 
         while True:
-            print(f"Waiting {INTERVAL_SECONDS} seconds before next check...")
+            # 1. Record start time when the countdown / wait begins
+            countdown_start_dt = datetime.now()
+            print(f"\n⏳ [CYCLE START] Waiting {INTERVAL_SECONDS} seconds before next check...")
+            print(f"🕒 [WAIT START] Timer started at: {format_detailed_time(countdown_start_dt)}")
+
             time.sleep(INTERVAL_SECONDS)
             
-            print(f"Checking cell B{current_row} for manual override value...")
+            # Fetch latest value from Column B for current row
+            print(f"🔎 Reading Column B value at Row {current_row}...")
             manual_b_val = sheet.cell(current_row, 2).value
             
-            if manual_b_val is not None and str(manual_b_val).strip() != "":
-                print(f"Found manual entry in B{current_row}: '{manual_b_val}'")
+            # Fallback if starting fresh on Row > 2
+            if last_b_value == 0 and current_row > 2:
+                prev_b_val = sheet.cell(current_row - 1, 2).value
                 try:
-                    last_b_value = int(manual_b_val)
-                    print(f"Parsed manual value as integer: {last_b_value}")
+                    last_b_value = int(prev_b_val) if prev_b_val is not None else 0
                 except ValueError:
-                    print(f"Could not convert '{manual_b_val}' to integer. Incrementing previous value instead.")
-                    last_b_value += 1
-            else:
-                print(f"No manual entry found in B{current_row}.")
-                if current_row == 2:
                     last_b_value = 0
-                else:
-                    last_b_value += 1
 
-            print(f"Updating Google Sheet -> A{current_row}: {sequence} | B{current_row}: {last_b_value}...")
+            if current_row == 2:
+                if manual_b_val is not None and str(manual_b_val).strip() != "":
+                    try:
+                        last_b_value = int(manual_b_val)
+                    except ValueError:
+                        last_b_value = 0
+                else:
+                    last_b_value = 0
+            else:
+                if manual_b_val is not None and str(manual_b_val).strip() != "":
+                    try:
+                        last_b_value = int(manual_b_val)
+                    except ValueError:
+                        last_b_value = (last_b_value or 0) + 1
+                else:
+                    last_b_value = (last_b_value or 0) + 1
+
+            # Update Google Sheet
+            print(f"📝 Writing to Google Sheet at Row {current_row} (A: {sequence}, B: {last_b_value})...")
             sheet.update(range_name=f"A{current_row}:B{current_row}", values=[[sequence, last_b_value]])
-            print(f"[SUCCESS LOGGED] Row {current_row} updated successfully -> Sequence: {sequence}, Value: {last_b_value}\n")
             
+            # 2. Record logged time immediately after update
+            logged_dt = datetime.now()
+            print(f"✅ [LOGGED SUCCESS] Row {current_row} -> A{current_row}: {sequence} | B{current_row}: {last_b_value}")
+            print(f"🕒 [LOGGED AT] Completed at: {format_detailed_time(logged_dt)}")
+
+            # 3. Calculate exact duration from Wait Start to Logged
+            duration = logged_dt - countdown_start_dt
+            total_sec = duration.total_seconds()
+            mins = int(total_sec // 60)
+            secs = total_sec % 60
+            print(f"⏱️ [ROW TIME GAP] Total time from timer start to logged: {mins} minutes {secs:.3f} seconds ({total_sec:.6f} seconds total)")
+            print("--------------------------------------------------")
+
             sequence += 1
             current_row += 1
 
     except Exception as e:
-        print(f"\nCRITICAL ERROR in automation loop: {e}")
+        print(f"\n❌ [ERROR] An error occurred in the automation loop: {e}")
 
 # Start background thread
 thread = threading.Thread(target=run_sheets_automation)
