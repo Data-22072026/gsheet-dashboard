@@ -1,5 +1,4 @@
 flask
-flask-socketio
 gspread
 google-auth
 gunicorn
